@@ -1,0 +1,149 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Draw a Digit</title>
+<style>
+  :root { --bg: #f6f5f1; --fg: #1d1d1b; --muted: #77756e; --card: #fff; --line: #dedcd5; --accent: #2f6fdf; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #151514; --fg: #ecebe6; --muted: #9a988f; --card: #1f1f1d; --line: #34332f; --accent: #6d9cf2; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg); font: 16px/1.5 system-ui, sans-serif; }
+  main { max-width: 760px; margin: 0 auto; padding: 32px 16px; }
+  h1 { margin: 0 0 4px; font-size: 1.6rem; }
+  p { margin: 0 0 24px; color: var(--muted); }
+  a { color: var(--accent); }
+  .row { display: flex; gap: 24px; flex-wrap: wrap; }
+  .pad { position: relative; width: 280px; max-width: 100%; }
+  #pad { width: 100%; aspect-ratio: 1; background: var(--card); border: 1px solid var(--line); border-radius: 12px; touch-action: none; cursor: crosshair; display: block; }
+  #hint { position: absolute; inset: 0; display: grid; place-items: center; color: var(--muted); pointer-events: none; }
+  button { margin-top: 10px; width: 100%; padding: 10px; font: inherit; border: 1px solid var(--line); border-radius: 8px; background: var(--card); color: var(--fg); cursor: pointer; }
+  button:hover { border-color: var(--muted); }
+  .out { flex: 1; min-width: 240px; }
+  .label { font-size: .8rem; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin-bottom: 6px; }
+  #pred { font-size: 5rem; line-height: 1; font-weight: 700; min-height: 5rem; margin-bottom: 20px; }
+  canvas.px { image-rendering: pixelated; background: #000; border-radius: 4px; }
+  #seen { width: 84px; height: 84px; margin-bottom: 20px; }
+  #nbrs { display: flex; gap: 10px; flex-wrap: wrap; }
+  #nbrs figure { margin: 0; text-align: center; font-size: .8rem; color: var(--muted); }
+  #nbrs canvas { width: 56px; height: 56px; display: block; margin-bottom: 2px; }
+  #nbrs b { color: var(--fg); }
+</style>
+</head>
+<body>
+<main>
+  <h1>Draw a digit</h1>
+  <p>A 1-nearest-neighbor classifier compares your drawing against 7,500 MNIST training images, pixel by pixel, and returns the label of the closest one.</p>
+  <div class="row">
+    <div class="pad">
+      <canvas id="pad" width="280" height="280" aria-label="Drawing area"></canvas>
+      <div id="hint">Loading training data…</div>
+      <button id="clear">Clear</button>
+    </div>
+    <div class="out">
+      <div class="label">Prediction</div>
+      <div id="pred" aria-live="polite"></div>
+      <div class="label">What the model sees (28×28)</div>
+      <canvas id="seen" class="px" width="28" height="28"></canvas>
+      <div class="label">Nearest training images</div>
+      <div id="nbrs"></div>
+    </div>
+  </div>
+</main>
+<script src="train.js"></script>
+<script>
+const N = 7500, D = 784;
+const pad = document.getElementById('pad'), ctx = pad.getContext('2d');
+const hint = document.getElementById('hint'), predEl = document.getElementById('pred');
+const seen = document.getElementById('seen'), nbrs = document.getElementById('nbrs');
+let train, labels, drawing = false, last = null, queued = false;
+
+try {
+  const bin = atob(TRAIN_B64), buf = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) buf[i] = bin.charCodeAt(i);
+  train = buf.subarray(0, N * D);
+  labels = buf.subarray(N * D, N * D + N);
+  hint.textContent = 'Draw a digit here';
+} catch (e) {
+  hint.textContent = typeof TRAIN_B64 === 'undefined'
+    ? 'train.js did not load. Open this page in Chrome, Edge or Firefox, or run the last notebook cell to generate it.'
+    : 'Could not read train.js: ' + e.message;
+}
+
+// Drawing: ink lives in the alpha channel so the pad can follow the page theme.
+ctx.lineWidth = 20; ctx.lineCap = ctx.lineJoin = 'round';
+const pos = e => { const r = pad.getBoundingClientRect(); return [(e.clientX - r.left) * 280 / r.width, (e.clientY - r.top) * 280 / r.height]; };
+pad.addEventListener('pointerdown', e => {
+  if (!train) return;
+  drawing = true; last = pos(e); pad.setPointerCapture(e.pointerId); hint.hidden = true;
+  ctx.strokeStyle = getComputedStyle(document.body).color;
+  stroke(last);
+});
+pad.addEventListener('pointermove', e => { if (drawing) stroke(pos(e)); });
+pad.addEventListener('pointerup', () => drawing = false);
+pad.addEventListener('pointercancel', () => drawing = false);
+document.getElementById('clear').onclick = () => {
+  ctx.clearRect(0, 0, 280, 280); predEl.textContent = ''; nbrs.innerHTML = '';
+  seen.getContext('2d').clearRect(0, 0, 28, 28); hint.hidden = !train;
+};
+
+function stroke(p) {
+  ctx.beginPath(); ctx.moveTo(...last); ctx.lineTo(...p); ctx.stroke(); last = p;
+  if (!queued) { queued = true; requestAnimationFrame(() => { queued = false; classify(); }); }
+}
+
+// MNIST-style preprocessing: fit the ink's bounding box into 20x20, then center by mass in 28x28.
+function toMnist() {
+  const a = ctx.getImageData(0, 0, 280, 280).data;
+  let x0 = 280, y0 = 280, x1 = -1, y1 = -1;
+  for (let y = 0; y < 280; y++) for (let x = 0; x < 280; x++)
+    if (a[(y * 280 + x) * 4 + 3]) { x0 = Math.min(x0, x); x1 = Math.max(x1, x); y0 = Math.min(y0, y); y1 = Math.max(y1, y); }
+  if (x1 < 0) return null;
+  const w = x1 - x0 + 1, h = y1 - y0 + 1, s = 20 / Math.max(w, h);
+  const small = document.createElement('canvas'); small.width = small.height = 28;
+  const sc = small.getContext('2d'); sc.imageSmoothingQuality = 'high';
+  sc.drawImage(pad, x0, y0, w, h, (28 - w * s) / 2, (28 - h * s) / 2, w * s, h * s);
+  const b = sc.getImageData(0, 0, 28, 28).data, img = new Float32Array(D);
+  let m = 0, cx = 0, cy = 0;
+  for (let i = 0; i < D; i++) { const v = b[i * 4 + 3]; img[i] = v; m += v; cx += v * (i % 28); cy += v * Math.floor(i / 28); }
+  const dx = Math.round(13.5 - cx / m), dy = Math.round(13.5 - cy / m), out = new Float32Array(D);
+  for (let y = 0; y < 28; y++) for (let x = 0; x < 28; x++) {
+    const sx = x - dx, sy = y - dy;
+    if (sx >= 0 && sx < 28 && sy >= 0 && sy < 28) out[y * 28 + x] = img[sy * 28 + sx];
+  }
+  return out;
+}
+
+function classify() {
+  const x = toMnist();
+  if (!x) return;
+  // Brute-force squared Euclidean distance to every training image (~6M ops, a few ms).
+  const dist = new Float64Array(N);
+  for (let n = 0, o = 0; n < N; n++, o += D) {
+    let d = 0;
+    for (let i = 0; i < D; i++) { const t = x[i] - train[o + i]; d += t * t; }
+    dist[n] = d;
+  }
+  const top = [...dist.keys()].sort((p, q) => dist[p] - dist[q]).slice(0, 5);
+  predEl.textContent = labels[top[0]];
+  paint(seen, x);
+  nbrs.innerHTML = '';
+  for (const n of top) {
+    const f = document.createElement('figure'), c = document.createElement('canvas');
+    c.width = c.height = 28; c.className = 'px';
+    paint(c, train.subarray(n * D, (n + 1) * D));
+    f.append(c); f.insertAdjacentHTML('beforeend', `<b>${labels[n]}</b>`);
+    nbrs.append(f);
+  }
+}
+
+function paint(canvas, px) {
+  const g = canvas.getContext('2d'), im = g.createImageData(28, 28);
+  for (let i = 0; i < D; i++) { im.data.fill(px[i], i * 4, i * 4 + 3); im.data[i * 4 + 3] = 255; }
+  g.putImageData(im, 0, 0);
+}
+</script>
+</body>
+</html>
